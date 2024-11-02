@@ -36,8 +36,7 @@ struct Registration {
 #[derive(Debug)]
 enum RoomEvent {
     Create,
-    AddUser,
-    Update,
+    AddUser(String),
 }
 
 #[derive(Debug)]
@@ -144,6 +143,11 @@ impl State {
     }
 
     fn create_game(&mut self, user: &User) {
+        let game_id = Uuid::new_v4();
+        self.join_game(game_id.to_string(), user, true);
+    }
+
+    fn join_game(&mut self, game_id: String, user: &User, is_owner: bool) {
         if let Some(room) = user.in_room.clone() {
             if self.games.contains_key(&room) {
                 println!("USER IN ROOM");
@@ -151,30 +155,45 @@ impl State {
             }
         }
 
-        let game_id = Uuid::new_v4();
+        if is_owner {
+            self.games.insert(
+                game_id.clone(),
+                Game {
+                    id: game_id.to_string(),
+                    status: GameStatus::Waiting,
+                    player1: Some(user.clone()),
+                    player2: None,
+                },
+            );
+        } else {
+            {
+                let mut game = self.games.get_mut(&game_id).unwrap();
+                game.player2 = Some(user.clone());
+                game.status = GameStatus::PlacingShips;
+            }
+            self.update_user(&user);
 
-        self.games.insert(
-            game_id.to_string(),
-            Game {
-                id: game_id.to_string(),
-                status: GameStatus::Waiting,
-                player1: Some(user.clone()),
-                player2: None,
-            },
-        );
+            if let Some(game) = self.games.get(&game_id) {
+                let json = json!([{
+                    "idGame": game.id.clone(),
+                    "idPlayer": game.player1.clone().unwrap().id,
+                }, {
+                    "idGame": game.id.clone(),
+                    "idPlayer": game.player2.clone().unwrap().id,
+                }]);
+
+                self.add_event(&ServerEvent::All(create_event_json(
+                    json,
+                    "create_game".into(),
+                )));
+            }
+        }
+        self.add_update_room_event();
 
         let user = User {
             in_room: Some(game_id.to_string()),
             ..user.clone()
         };
-
-        self.update_user(&user);
-
-        let json = json!({
-            "idGame": game_id.to_string(),
-            "idPlayer": user.id,
-        });
-        self.add_update_room_event();
     }
 
     fn add_user_to_game() {}
@@ -210,14 +229,14 @@ pub fn handle_event(addr: &SocketAddr, event_json: &str, state: &mut ServerState
     let json: serde_json::Value =
         serde_json::from_str(event_json).unwrap_or(serde_json::Value::Null);
     println!("Received json: {:?}", json);
-    let event = parse_event(&addr, json);
+    let event = parse_event(json);
 
     match event {
         Ok(event) => {
             println!("Event {:?}", event);
             let user = {
-                let lock = state.read().unwrap();
-                lock.users.get(&addr).cloned()
+                let state_lock = state.read().unwrap();
+                state_lock.users.get(&addr).cloned()
             };
 
             match event {
@@ -234,9 +253,9 @@ pub fn handle_event(addr: &SocketAddr, event_json: &str, state: &mut ServerState
                                 in_room: None,
                             };
 
-                            let mut lock = state.write().unwrap();
-                            let user = lock.add_user(&user);
-                            lock.add_update_room_event();
+                            let mut state_lock = state.write().unwrap();
+                            let user = state_lock.add_user(&user);
+                            state_lock.add_update_room_event();
 
                             let data = json!({
                                 "name": user.name,
@@ -246,7 +265,7 @@ pub fn handle_event(addr: &SocketAddr, event_json: &str, state: &mut ServerState
                             });
                             let json = create_event_json(data, "reg".into());
 
-                            lock.add_event(&ServerEvent::User(user.addr, json));
+                            state_lock.add_event(&ServerEvent::User(user.addr, json));
                         }
                     },
                 },
@@ -255,7 +274,10 @@ pub fn handle_event(addr: &SocketAddr, event_json: &str, state: &mut ServerState
                         let user = user.unwrap();
                         state.write().unwrap().create_game(&user);
                     }
-                    _ => {}
+                    RoomEvent::AddUser(game_id) => {
+                        let user = user.unwrap();
+                        state.write().unwrap().join_game(game_id, &user, false);
+                    }
                 },
 
                 _ => {}
@@ -285,7 +307,7 @@ fn create_event_json(data: serde_json::Value, event_type: String) -> String {
     json
 }
 
-fn parse_event(addr: &SocketAddr, json: serde_json::Value) -> Result<ClientEvent, Error> {
+fn parse_event(json: serde_json::Value) -> Result<ClientEvent, Error> {
     println!("json <- {:?}", json);
 
     let event_type: &str = json["type"].as_str().unwrap_or("unknown");
@@ -300,6 +322,9 @@ fn parse_event(addr: &SocketAddr, json: serde_json::Value) -> Result<ClientEvent
             username: data_json["name"].as_str().unwrap().to_owned(),
         }))),
         "create_room" => Ok(ClientEvent::Room(RoomEvent::Create)),
+        "add_user_to_room" => Ok(ClientEvent::Room(RoomEvent::AddUser(
+            data_json["indexRoom"].as_str().unwrap().to_owned(),
+        ))),
         &_ => Err(Error {
             text: "Unknown event type".to_owned(),
         }),
