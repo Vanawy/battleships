@@ -14,3 +14,8 @@ Thumbs.db
 
 # Logs
 npm-debug.log
+
+
+# Added by cargo
+
+/target
